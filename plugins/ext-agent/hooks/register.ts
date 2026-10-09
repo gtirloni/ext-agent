@@ -21,8 +21,8 @@ const KEPT = 1500
 /** Messages of a worker's transcript kept when it is compacted. */
 const KEEP_MESSAGES = 80
 
-type Config = { blockBuiltin: boolean; defaultModel: string; worktreeLayout: 'claude' | 'sibling' }
-let config: Config = { blockBuiltin: false, defaultModel: 'pi', worktreeLayout: 'claude' }
+type Config = { blockBuiltin: boolean; defaultModel: string; worktreeLayout: 'claude' | 'sibling'; stallMinutes: number; toolStallMinutes: number }
+let config: Config = { blockBuiltin: false, defaultModel: 'pi', worktreeLayout: 'claude', stallMinutes: 15, toolStallMinutes: 45 }
 
 const usage = (why: string) =>
   `${why}\n\n` +
@@ -187,6 +187,10 @@ type Run = {
   current: string
   texts: Map<string, string>
   lastMessage: string
+  /** The CLI's own ids of the tool calls running now. */
+  active: Set<string>
+  /** Why the watchdog ended the run, if it did. */
+  stalled?: string
   ended?: string
 }
 
@@ -258,8 +262,34 @@ function called(run: Run, cliId: string, tool: string, args: Record<string, any>
 }
 
 /** Reads the CLI's next piece of output into the run's events and outcomes. */
+/**
+ * The CLI's next output, or 'stalled' once it has been silent too long and the
+ * watchdog has stopped it. A worker that only waits on a hung command or a dead
+ * connection would otherwise sit there for hours. While a tool call runs the
+ * limit is the longer `toolStallMinutes`: a build or a test run prints nothing
+ * for a while on purpose.
+ */
+async function nextOutput(run: Run) {
+  const limit = (run.active.size > 0 ? config.toolStallMinutes : config.stallMinutes) * 60_000
+  if (limit === 0) return run.stream.next()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<'stalled'>((resolve) => { timer = setTimeout(() => resolve('stalled'), limit) })
+  try {
+    const piece = await Promise.race([run.stream.next(), late])
+    if (piece !== 'stalled') return piece
+  } finally { clearTimeout(timer) }
+  const what = run.active.size > 0 ? 'a tool call that has not finished' : 'a reply from the model'
+  run.stalled = `no output for ${limit / 60_000} minutes, waiting for ${what}`
+  run.error = `✗ stalled: ${run.stalled}; ext-agent stopped it.`
+  run.events.push({ kind: 'show', text: `\n${run.error}\n` })
+  run.ended = 'stalled'
+  void run.stream.return(undefined as never).catch(() => {})
+  return 'stalled'
+}
+
 async function pull(run: Run) {
-  const piece = await run.stream.next()
+  const piece = await nextOutput(run)
+  if (piece === 'stalled') return
   if (piece.done) {
     const { code, signal } = piece.value
     if (run.spec.cli === 'pi' && run.current.trim()) run.answer = run.current
@@ -282,8 +312,9 @@ async function pull(run: Run) {
       const d = ev.type === 'message_update' ? ev.assistantMessageEvent : undefined
       if (ev.type === 'message_start' && ev.message?.role === 'assistant') run.current = ''
       if (d?.type === 'text_delta') { run.current += d.delta ?? ''; show(d.delta ?? '') }
-      if (ev.type === 'tool_execution_start') called(run, ev.toolCallId, ev.toolName, ev.args)
+      if (ev.type === 'tool_execution_start') { run.active.add(ev.toolCallId); called(run, ev.toolCallId, ev.toolName, ev.args) }
       if (ev.type === 'tool_execution_end') {
+        run.active.delete(ev.toolCallId)
         const id = run.ids.get(ev.toolCallId)
         if (id) run.outcomes.set(id, { output: textOf(ev.result?.content), isError: ev.isError === true })
       }
@@ -330,11 +361,16 @@ function failureOf(run: Run) {
 
 // ---------------------------------------------------------------------------
 
+/** A positive number of minutes from a plugin option, else the default. 0 turns the check off. */
+const minutes = (value: unknown, fallback: number) => (typeof value === 'number' && value >= 0 ? value : fallback)
+
 export const register: Register = (on, options) => {
   config = {
     blockBuiltin: options.blockBuiltin === true,
     defaultModel: String(options.defaultModel || 'pi'),
     worktreeLayout: options.worktreeLayout === 'sibling' ? 'sibling' : 'claude',
+    stallMinutes: minutes(options.stallMinutes, 15),
+    toolStallMinutes: minutes(options.toolStallMinutes, 45),
   }
 
   if (config.blockBuiltin) on('agent.offer', ($, e, next) => (e.agent === TYPE || e.provider.plugin.split('@')[0] === 'ext-agent' ? next(e) : { isOffered: false }))
@@ -487,7 +523,7 @@ async function started($: EngineInterface, agentId: string, name: string): Promi
     spec, stream: $.process.spawn({ argv: supervised(cwd, argv) }),
     events: [{ kind: 'show', text: `${spec.cli} ${spec.model ?? '(default model)'} in ${cwd}\n` }],
     calls: new Map(), outcomes: new Map(), ids: new Map(),
-    buffer: '', stderr: '', error: '', answered: spec.model ?? spec.cli, answer: '', current: '', texts: new Map(), lastMessage: '',
+    active: new Set(), buffer: '', stderr: '', error: '', answered: spec.model ?? spec.cli, answer: '', current: '', texts: new Map(), lastMessage: '',
   }
   runs.set(agentId, run)
   return run
@@ -544,6 +580,7 @@ const workerStep: StreamHook<'turn.step'> = async function* ($, e, next) {
   }
 
   runs.delete(agentId)
+  if (run.stalled) return yield* finish(`ext-agent: stopped ${run.spec.cli} (${run.spec.model ?? 'default model'}): ${run.stalled}.${run.answer.trim() ? `\nLast text before it stalled:\n${run.answer.trim()}` : ''}`)
   if (run.answer.trim()) return yield* finish(`${run.answer.trim()}\n\n— answered by ${run.spec.cli}, ${run.answered}`)
   return yield* finish(failureOf(run))
 }

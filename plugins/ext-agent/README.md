@@ -181,3 +181,11 @@ Claude Code.
 ## License
 
 MIT
+
+## Stall watchdog
+
+A worker whose `pi` / `opencode` process prints nothing for `stallMinutes` (default 15) while no tool call is running, or
+for `toolStallMinutes` (default 45) while one has started and not finished, is stopped. The Agent call then answers
+`ext-agent: stopped pi (...): no output for N minutes, waiting for ...`, so the dispatcher hears about it instead of
+waiting for hours. `0` turns a limit off. pi's OSC 7501 status reports exist only in its interactive mode; the plugin
+runs `pi -p --mode json`, so it reads the event stream instead.

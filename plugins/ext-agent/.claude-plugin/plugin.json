@@ -33,6 +33,18 @@
       "title": "Worktree layout",
       "description": "Where `worktree:` / isolation \"worktree\" puts the checkout. \"claude\" (default): <repo>/.claude/worktrees/<name> on branch worktree-<name>, as Claude Code does (honours the worktree.baseRef setting). \"sibling\": <repo>-wt/<name> on branch wip/<name>, off main. Any other value counts as \"claude\".",
       "default": "claude"
+    },
+    "stallMinutes": {
+      "type": "number",
+      "title": "Stall limit (minutes)",
+      "description": "A worker whose pi / opencode process prints nothing for this long while no tool call runs is stopped and the Agent call answers that it stalled. 0 turns the check off.",
+      "default": 15
+    },
+    "toolStallMinutes": {
+      "type": "number",
+      "title": "Stall limit during a tool call (minutes)",
+      "description": "The same, while a tool call (a build, a test run, a render) has started and not finished. Longer, because those print nothing on purpose. 0 turns the check off.",
+      "default": 45
     }
   },
   "icon": "./.claude-plugin/icon.png"
