@@ -21,8 +21,8 @@ const KEPT = 1500
 /** Messages of a worker's transcript kept when it is compacted. */
 const KEEP_MESSAGES = 80
 
-type Config = { blockBuiltin: boolean; defaultModel: string; worktreeLayout: 'claude' | 'sibling'; stallMinutes: number; toolStallMinutes: number }
-let config: Config = { blockBuiltin: false, defaultModel: 'pi', worktreeLayout: 'claude', stallMinutes: 15, toolStallMinutes: 45 }
+type Config = { blockBuiltin: boolean; defaultModel: string; worktreeLayout: 'claude' | 'sibling'; stallMinutes: number; toolStallMinutes: number; worktreeBase: string; worktreeSeed: string }
+let config: Config = { blockBuiltin: false, defaultModel: 'pi', worktreeLayout: 'claude', stallMinutes: 15, toolStallMinutes: 45, worktreeBase: "", worktreeSeed: "" }
 
 const usage = (why: string) =>
   `${why}\n\n` +
@@ -115,6 +115,17 @@ async function opencodeSession($: EngineInterface, cwd: string, title: string) {
  * `<repo>-wt/<name>` beside the repository on `wip/<name>`, off `main`.
  * An existing worktree or branch of that name is reused.
  */
+/**
+ * Runs the `worktreeSeed` command (a program and its arguments, split on spaces)
+ * in a worktree, so every worker starts from the project's warm build cache.
+ * The command must be safe to run again; its failure never blocks the worker.
+ */
+async function seeded($: EngineInterface, path: string) {
+  const argv = config.worktreeSeed.split(/\s+/).filter(Boolean)
+  if (argv.length === 0) return
+  await $.process.run(['/bin/sh', '-c', 'cd "$1" && shift && exec "$@"', 'sh', path, ...argv])
+}
+
 async function worktreeOf($: EngineInterface, cwd: string, label: string) {
   const git = (...argv: string[]) => $.process.run(['git', '-C', cwd, ...argv])
   const top = await git('rev-parse', '--show-toplevel')
@@ -128,14 +139,15 @@ async function worktreeOf($: EngineInterface, cwd: string, label: string) {
   // branches can be used again.
   await git('worktree', 'prune')
   const listed = await git('worktree', 'list', '--porcelain')
-  if (listed.stdout.split('\n').includes(`worktree ${path}`)) return { path }
+  if (listed.stdout.split('\n').includes(`worktree ${path}`)) { await seeded($, path); return { path } }
   const exists = await git('rev-parse', '--verify', '-q', `refs/heads/${branch}`)
   let argv: string[]
   if (exists.exitCode === 0) argv = [path, branch]
   else {
     let base: string | undefined
     if (sibling) {
-      if ((await git('rev-parse', '--verify', '-q', 'main')).exitCode === 0) base = 'main'
+      const wanted = config.worktreeBase || 'main'
+      if ((await git('rev-parse', '--verify', '-q', wanted)).exitCode === 0) base = wanted
     } else if (((await $.settings.read()) as { worktree?: { baseRef?: string } }).worktree?.baseRef !== 'head') {
       const remote = await git('symbolic-ref', '--short', 'refs/remotes/origin/HEAD')
       if (remote.exitCode === 0) base = remote.stdout.trim()
@@ -144,6 +156,7 @@ async function worktreeOf($: EngineInterface, cwd: string, label: string) {
   }
   const added = await git('worktree', 'add', '-q', ...argv)
   if (added.exitCode !== 0) return { error: added.stderr.trim() || `git worktree add exited ${added.exitCode}` }
+  await seeded($, path)
   return { path }
 }
 
@@ -371,6 +384,8 @@ export const register: Register = (on, options) => {
     worktreeLayout: options.worktreeLayout === 'sibling' ? 'sibling' : 'claude',
     stallMinutes: minutes(options.stallMinutes, 15),
     toolStallMinutes: minutes(options.toolStallMinutes, 45),
+    worktreeBase: String(options.worktreeBase || ""),
+    worktreeSeed: String(options.worktreeSeed || ""),
   }
 
   if (config.blockBuiltin) on('agent.offer', ($, e, next) => (e.agent === TYPE || e.provider.plugin.split('@')[0] === 'ext-agent' ? next(e) : { isOffered: false }))

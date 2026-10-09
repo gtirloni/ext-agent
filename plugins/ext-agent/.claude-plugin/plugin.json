@@ -45,6 +45,18 @@
       "title": "Stall limit during a tool call (minutes)",
       "description": "The same, while a tool call (a build, a test run, a render) has started and not finished. Longer, because those print nothing on purpose. 0 turns the check off.",
       "default": 45
+    },
+    "worktreeBase": {
+      "type": "string",
+      "title": "Worktree base (sibling layout)",
+      "description": "Branch a new sibling worktree starts from. Empty (default): main.",
+      "default": ""
+    },
+    "worktreeSeed": {
+      "type": "string",
+      "title": "Worktree seed command",
+      "description": "A program and its arguments (split on spaces), run inside every worktree the plugin makes or reuses, for example one that clones a warm build cache into it. It must be safe to run again; its failure does not stop the worker. Empty (default): none.",
+      "default": ""
     }
   },
   "icon": "./.claude-plugin/icon.png"

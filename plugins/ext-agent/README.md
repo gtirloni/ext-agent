@@ -189,3 +189,10 @@ for `toolStallMinutes` (default 45) while one has started and not finished, is s
 `ext-agent: stopped pi (...): no output for N minutes, waiting for ...`, so the dispatcher hears about it instead of
 waiting for hours. `0` turns a limit off. pi's OSC 7501 status reports exist only in its interactive mode; the plugin
 runs `pi -p --mode json`, so it reads the event stream instead.
+
+## Worktree base and seed
+
+`worktreeBase` (sibling layout) names the branch a new worktree starts from instead of `main`. `worktreeSeed` is a
+program with arguments that runs inside every worktree the plugin makes or reuses, so a project can give each worker a
+warm build cache (for example a copy-on-write clone of a shared cargo target directory). It must be safe to run again;
+a failure is ignored.
