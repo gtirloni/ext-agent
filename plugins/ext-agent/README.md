@@ -196,3 +196,9 @@ runs `pi -p --mode json`, so it reads the event stream instead.
 program with arguments that runs inside every worktree the plugin makes or reuses, so a project can give each worker a
 warm build cache (for example a copy-on-write clone of a shared cargo target directory). It must be safe to run again;
 a failure is ignored.
+
+## Worker logs
+
+Each run appends the CLI's stderr, its start line and how it ended (exit code, or a signal sent to the
+supervisor) to `~/.claude/state/ext-agent/<session key>.log`, where the session key is `ext-<agent name>`.
+Read it when a worker ends without an answer.

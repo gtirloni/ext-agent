@@ -84,11 +84,20 @@ async function specOf($: EngineInterface, model = config.defaultModel): Promise<
  * down whole when the engine ends it (TaskStop, an interrupt), so no tool the
  * CLI started outlives the worker.
  */
-const supervised = (dir: string, argv: string[]) => [
+const supervised = (dir: string, argv: string[], log: string) => [
   '/bin/sh', '-c',
-  'cd "$1" && shift; set -m; "$@" & pid=$!; trap "kill -TERM -$pid 2>/dev/null; exit 143" TERM INT HUP; wait $pid',
-  'sh', dir, ...argv,
+  // The log keeps the CLI's whole stderr and how the run ended (its own exit
+  // code, or a signal sent to this supervisor), which the 4000 characters kept
+  // in memory lose once the session is gone.
+  'log="$1"; cd "$2" && shift 2; mkdir -p "$(dirname "$log")"; echo "--- $(date "+%F %T") start in $PWD: $1 $2 $3 $4 $5" >>"$log"; ' +
+  'set -m; "$@" 2>>"$log" & pid=$!; ' +
+  'trap \'echo "--- $(date "+%F %T") supervisor got a signal, stopping the worker" >>"$log"; kill -TERM -$pid 2>/dev/null; exit 143\' TERM INT HUP; ' +
+  'wait $pid; code=$?; echo "--- $(date "+%F %T") exit $code" >>"$log"; tail -c 4000 "$log" >&2; exit $code',
+  'sh', log, dir, ...argv,
 ]
+
+/** Where a worker's stderr and exit reason are kept, one file per session key. */
+const logOf = (key: string) => `${process.env.HOME ?? '/tmp'}/.claude/state/ext-agent/${key}.log`
 
 /**
  * The session a worker's earlier turn left, by its title. Listed through a
@@ -535,7 +544,7 @@ async function started($: EngineInterface, agentId: string, name: string): Promi
       ...(session ? ['--session', session] : []), header.body]
   }
   const run: Run = {
-    spec, stream: $.process.spawn({ argv: supervised(cwd, argv) }),
+    spec, stream: $.process.spawn({ argv: supervised(cwd, argv, logOf(key)) }),
     events: [{ kind: 'show', text: `${spec.cli} ${spec.model ?? '(default model)'} in ${cwd}\n` }],
     calls: new Map(), outcomes: new Map(), ids: new Map(),
     active: new Set(), buffer: '', stderr: '', error: '', answered: spec.model ?? spec.cli, answer: '', current: '', texts: new Map(), lastMessage: '',
