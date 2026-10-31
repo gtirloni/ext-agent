@@ -220,6 +220,17 @@ const runs = new Map<string, Run>()
 const ours = new Set<string>()
 /** The header each worker was spawned with, past the 4096 messages a read returns. */
 const spawned = new Map<string, Header>()
+/**
+ * The tool that delivers a subagent's report when the engine requires one (auto
+ * mode): text at the end of a run reaches no one, and the engine sends the
+ * subagent back to work. pi and opencode have no such tool, so a worker's last
+ * step calls it for them.
+ */
+const HANDBACK = 'SubagentHandback'
+/** Each worker's final answer, for a nudge to report it again. */
+const answers = new Map<string, string>()
+/** Workers that just called HANDBACK; their next step ends the turn. */
+const handedBack = new Set<string>()
 let serial = 0
 
 /** One of the worker's own tool calls standing for a CLI's. */
@@ -553,6 +564,14 @@ async function started($: EngineInterface, agentId: string, name: string): Promi
   return run
 }
 
+/** Whether the newest message is the engine's alone, not a task from a person or agent. */
+async function nudged($: EngineInterface, agentId: string) {
+  const messages = await $.session.messages({ agentId })
+  if ('deny' in messages) return false
+  const newest = messages.findLast((m) => m.role === 'user' && m.text !== '' && !m.toolResults?.length)
+  return newest !== undefined && newest.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim() === ''
+}
+
 /**
  * A worker's step: the CLI's output up to its next tool call (the step ends
  * calling the matching tool) or to its end (the step ends with its answer).
@@ -569,11 +588,30 @@ const workerStep: StreamHook<'turn.step'> = async function* ($, e, next) {
     return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn' as const, usage: null }
   }
 
+  // The answer goes out through HANDBACK and then as text, so it arrives whether
+  // or not this run has that tool: a run without it just gets a failed call.
+  const report = async function* (answer: string) {
+    answers.set(agentId, answer)
+    handedBack.add(agentId)
+    const input = { message: answer }
+    yield { kind: 'tool', index: 1, id: `toolu_ext_${Date.now().toString(36)}_${(serial++).toString(36)}`, name: HANDBACK } as TurnStepChunk
+    yield { kind: 'input', index: 1, json: JSON.stringify(input) } as TurnStepChunk
+    yield { kind: 'stop', stopReason: 'tool_use', usage: null } as TurnStepChunk
+    return {
+      turnId: e.turnId, index: e.index, answer: '',
+      toolUses: [{ name: HANDBACK, input }], stopReason: 'tool_use' as const, usage: null,
+    }
+  }
+
+  if (handedBack.delete(agentId) && e.index > 0) return yield* finish(answers.get(agentId) ?? 'Report delivered.')
+  const reported = answers.get(agentId)
+  if (e.index === 0 && reported !== undefined && (await nudged($, agentId))) return yield* report(reported)
+
   let run = runs.get(agentId)
   if (e.index === 0 || run === undefined) {
     stop(agentId)
     const made = await started($, agentId, agent.name ?? agent.id)
-    if (typeof made === 'string') return yield* finish(made)
+    if (typeof made === 'string') return yield* report(made)
     run = made
   }
 
@@ -604,7 +642,7 @@ const workerStep: StreamHook<'turn.step'> = async function* ($, e, next) {
   }
 
   runs.delete(agentId)
-  if (run.stalled) return yield* finish(`ext-agent: stopped ${run.spec.cli} (${run.spec.model ?? 'default model'}): ${run.stalled}.${run.answer.trim() ? `\nLast text before it stalled:\n${run.answer.trim()}` : ''}`)
-  if (run.answer.trim()) return yield* finish(`${run.answer.trim()}\n\n— answered by ${run.spec.cli}, ${run.answered}`)
-  return yield* finish(failureOf(run))
+  if (run.stalled) return yield* report(`ext-agent: stopped ${run.spec.cli} (${run.spec.model ?? 'default model'}): ${run.stalled}.${run.answer.trim() ? `\nLast text before it stalled:\n${run.answer.trim()}` : ''}`)
+  if (run.answer.trim()) return yield* report(`${run.answer.trim()}\n\n— answered by ${run.spec.cli}, ${run.answered}`)
+  return yield* report(failureOf(run))
 }

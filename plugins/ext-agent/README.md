@@ -177,6 +177,8 @@ Claude Code.
 - *"ended without an answer"*: the CLI exited without a reply; the message includes its error or last stderr lines
   (often an authentication or provider error).
 - Check the plugin loads: `claude plugin validate plugins/ext-agent`.
+- *The result says the subagent "ended without delivering a report through SubagentHandback"*: the worker is running an older copy of this plugin; restart Claude Code. In auto mode the engine only accepts a report through that tool, so a worker's last step calls it for the CLI, then ends with the same text for runs that do not have the tool.
+- *The agent answers "ext-agent is not active" although the variable is set*: the dispatch named the agent (`name`), which starts a separate teammate process where this plugin does not take over. Leave `name` out.
 
 ## License
 
