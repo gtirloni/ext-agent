@@ -80,7 +80,7 @@ Set these in Claude Code's plugin config menu (each option is a row there), or i
 
 | Option | Default | |
 | --- | --- | --- |
-| `blockBuiltin` | `false` | `false`: `ext-agent:worker` is added next to the built-in agent types. `true`: only `ext-agent:worker` can be dispatched; built-in types are hidden from the model and refused with a message saying how to dispatch instead. |
+| `blockBuiltin` | `false` | `false`: `ext-agent:worker` is added next to the built-in agent types. `true`: only `ext-agent:worker` and configured custom routes can be dispatched; built-in types are hidden from the model and refused with a message saying how to dispatch instead. |
 | `defaultModel` | `pi` | Used when an Agent call names no `model:`. Same syntax as the header, e.g. `pi:openai-codex/gpt-6-luna:high`. |
 | `worktreeLayout` | `claude` | `claude`: `<repo>/.claude/worktrees/<name>` on branch `worktree-<name>`, as Claude Code does; a new branch starts from the remote's default branch, or from the current `HEAD` if the `worktree.baseRef` setting is `head`. `sibling`: `<repo>-wt/<name>` beside the repo on branch `wip/<name>`, off `main`. |
 
@@ -97,6 +97,49 @@ Example, blocking built-in agents and using a fixed pi model:
   }
 }
 ```
+
+## Route existing agents (including GSD)
+
+Configure `agentRoutes` in the plugin's options. Its value is a JSON **string** mapping exact registered `subagent_type` names to an external runtime, optional model, and role instructions file. For example, paste this into the **Custom agent routes (JSON)** option:
+
+```json
+{
+  "gsd-executor": {
+    "runtime": "opencode",
+    "model": "PROVIDER/MODEL",
+    "instructionsFile": "~/.claude/agents/gsd-executor.md"
+  },
+  "gsd-verifier": {
+    "runtime": "pi",
+    "instructionsFile": "~/.claude/agents/gsd-verifier.md"
+  }
+}
+```
+
+Replace `PROVIDER/MODEL` with an installed runtime's model identifier (`opencode models` lists OpenCode's). Omit `model` to use that runtime's default. Authenticate and configure providers in Pi/OpenCode themselves; this mod does not manage credentials.
+
+For direct editing of Claude Code's `settings.json`, the same option is stored as an escaped string:
+
+```json
+{
+  "pluginConfigs": {
+    "ext-agent@ext-agent": {
+      "options": {
+        "blockBuiltin": false,
+        "agentRoutes": "{\"gsd-executor\":{\"runtime\":\"opencode\",\"model\":\"PROVIDER/MODEL\",\"instructionsFile\":\"~/.claude/agents/gsd-executor.md\"}}"
+      }
+    }
+  }
+}
+```
+
+No GSD workflow changes are needed: `Agent(subagent_type="gsd-executor", model="sonnet", ...)` keeps its original type, but the route takes precedence over the requested Claude model. Unlisted types, such as `gsd-planner`, stay native with `blockBuiltin: false`. With `blockBuiltin: true`, only routed types and `ext-agent:worker` are allowed. The custom agent must already be registered in Claude Code; this option does not create agent definitions.
+
+`instructionsFile` explicitly identifies the role body to send with the task. Use an absolute path or `~/...` and point it at the actual agent definition used by your GSD installation. YAML frontmatter is stripped. Claude-specific frontmatter settings, tool restrictions, skills and MCP configuration are **not** translated into Pi/OpenCode settings; configure equivalent capabilities in the external runtime. The role text is supplied as task context alongside that runtime's own system prompt, not as a replacement system prompt.
+
+Edit the option to change models or add/remove routes; no plugin code edits are required. Finish active workers before changing configuration, then start a new Claude Code session. Within a loaded plugin instance, follow-up messages keep the worker's bound model and role text and reuse its external session.
+
+Invalid route configuration blocks Agent dispatch with a diagnostic until fixed. Missing/empty role files, startup errors and unsuccessful external runs report errors; they do not retry with Claude or another provider. The existing permissions and worktree behavior described below still apply.
 
 ## How it works
 

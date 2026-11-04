@@ -1,4 +1,5 @@
 import type { EngineInterface, Register, StreamHook, TurnStepChunk } from 'claude-code'
+import { parseRoutes, routeModel, instructionsBody, rolePrompt, type Routes } from './routing.ts'
 
 /**
  * ext-agent: adds the Agent tool's `ext-agent:worker` type, whose turns run
@@ -34,7 +35,23 @@ const usage = (why: string) =>
   `The default model is "${config.defaultModel}". Give the Agent a \`name\` to continue its session later.` +
   (config.blockBuiltin ? '\nBuilt-in subagent types are disabled by this plugin\'s blockBuiltin option.' : '')
 
-const isWorker = (type: string) => type === TYPE
+let routes: Routes = Object.create(null)
+let routingError = ''
+const isWorker = (type: string) => type === TYPE || Object.hasOwn(routes, type)
+// Pin the external model and role text to an agent ID for follow-up turns.
+const bindings = new Map<string, { model: string; instructions: string; type: string }>()
+
+async function readRole($: EngineInterface, type: string): Promise<string> {
+  let path = routes[type].instructionsFile
+  if (path.startsWith('~/')) {
+    const home = await $.env.get('HOME')
+    if (!home) throw new Error('HOME is unavailable; use an absolute instructionsFile')
+    path = `${home}/${path.slice(2)}`
+  }
+  const body = instructionsBody(await $.fs.read(path))
+  if (!body) throw new Error(`Empty agent instructions: ${path}`)
+  return body
+}
 
 const clip = (text: string, max = KEPT) =>
   text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more characters kept by the CLI only)`
@@ -177,7 +194,9 @@ async function worktreeOf($: EngineInterface, cwd: string, label: string) {
 function movedModel(json: string) {
   let input: Record<string, unknown>
   try { input = JSON.parse(json) } catch { return json }
-  const model = input.model
+  const type = String(input.subagent_type ?? 'general-purpose')
+  if (!isWorker(type)) return json
+  const model = Object.hasOwn(routes, type) ? routeModel(routes[type]) : input.model
   if (typeof model !== 'string' || !/^(pi|opencode)(:|$)/.test(model)) return json
   const prompt = typeof input.prompt === 'string' ? input.prompt : ''
   const rest = prompt.replace(/^\s*model[ \t]*:.*(\n|$)/i, '')
@@ -398,6 +417,11 @@ function failureOf(run: Run) {
 const minutes = (value: unknown, fallback: number) => (typeof value === 'number' && value >= 0 ? value : fallback)
 
 export const register: Register = (on, options) => {
+  routingError = ''
+  try { routes = parseRoutes(options.agentRoutes) } catch (error) {
+    routes = Object.create(null)
+    routingError = `ext-agent: invalid agentRoutes: ${String(error)}`
+  }
   config = {
     blockBuiltin: options.blockBuiltin === true,
     defaultModel: String(options.defaultModel || 'pi'),
@@ -408,7 +432,7 @@ export const register: Register = (on, options) => {
     worktreeSeed: String(options.worktreeSeed || ""),
   }
 
-  if (config.blockBuiltin) on('agent.offer', ($, e, next) => (e.agent === TYPE || e.provider.plugin.split('@')[0] === 'ext-agent' ? next(e) : { isOffered: false }))
+  if (config.blockBuiltin) on('agent.offer', ($, e, next) => (isWorker(e.agent) || e.provider.plugin.split('@')[0] === 'ext-agent' ? next(e) : { isOffered: false }))
 
   on('tool.describe', { tool: 'Agent' }, async ($, e, next) => {
     const described = await next(e)
@@ -419,7 +443,8 @@ export const register: Register = (on, options) => {
         `ext-agent: subagent_type "${TYPE}" runs the task in pi or opencode instead of a Claude model. Its \`model\` takes ` +
         `"pi[:<provider>/<model>[:<thinking>]]" or "opencode[:<provider/model[#variant]>]" (\`opencode models\` lists them); ` +
         `Claude model names do nothing for it. The default is "${config.defaultModel}".` +
-        (config.blockBuiltin ? ' It is the only subagent_type allowed.' : ''),
+        ` Configured external agent types: ${Object.keys(routes).join(', ') || '(none)'}. Keep their normal subagent_type; routing overrides their model selection.` +
+        (config.blockBuiltin ? ' Only configured external types and ext-agent:worker are allowed.' : ''),
     }
   })
 
@@ -461,6 +486,10 @@ export const register: Register = (on, options) => {
     next.signal.addEventListener('abort', onAbort)
     try {
       while (!run.outcomes.has(e.tool_use_id) && run.ended === undefined) await pull(run)
+    } catch (error) {
+      run.error = String(error)
+      run.ended = 'stream error'
+      return { deny: `ext-agent: external tool failed: ${String(error)}` }
     } finally {
       next.signal.removeEventListener('abort', onAbort)
     }
@@ -477,7 +506,7 @@ export const register: Register = (on, options) => {
   on('session.compact', async ($, e, next) => {
     if (e.agentId === undefined) return next(e)
     const agent = (await $.agent.list()).find((a) => a.id === e.agentId)
-    if (agent === undefined || !isWorker(agent.type)) return next(e)
+    if (agent === undefined || (!isWorker(agent.type) && !bindings.has(agent.id))) return next(e)
     const m = e.messages
     // The tail starts on an assistant message, so a tool_use keeps its result.
     let cut = Math.max(m.length - KEEP_MESSAGES, 1)
@@ -496,12 +525,21 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    if (routingError) return { deny: routingError }
     const type = e.subagent_type ?? 'general-purpose'
     if (!isWorker(type)) return config.blockBuiltin ? { deny: usage(`subagent_type "${type}" is not allowed.`) } : next(e)
     const header = headerOf(e.prompt)
-    const spec = await specOf($, header.model)
+    if (Object.hasOwn(routes, type)) {
+      header.model = routeModel(routes[type])
+      try { await readRole($, type) } catch (error) { return { deny: `ext-agent: ${String(error)}` } }
+    }
+    const spec = await specOf($, header.model).catch((error) => ({ error: `External model validation failed: ${String(error)}` }))
     if ('error' in spec) return { deny: usage(spec.error) }
-    if (e.isolation !== 'worktree') return next(e)
+    if (e.isolation !== 'worktree') return next({ ...e, prompt: [
+      `model: ${header.model ?? config.defaultModel}`,
+      ...(header.cwd ? [`cwd: ${header.cwd}`] : []),
+      ...(header.worktree ? [`worktree: ${header.worktree}`] : []), '', header.body,
+    ].join('\n') })
 
     // The engine's worktree is the subagent's cwd, which pi / opencode never
     // see; the worker makes its own from a `worktree:` line instead. Only the
@@ -518,7 +556,7 @@ export const register: Register = (on, options) => {
 }
 
 /** Starts the CLI for a worker's turn, or says why it cannot. */
-async function started($: EngineInterface, agentId: string, name: string): Promise<Run | string> {
+async function started($: EngineInterface, agentId: string, name: string, type: string): Promise<Run | string> {
   // The newest user message is the task: the spawn's prompt, or a SendMessage.
   // Its model, cwd and worktree are the spawn's unless it names its own.
   const messages = await $.session.messages({ agentId })
@@ -534,6 +572,14 @@ async function started($: EngineInterface, agentId: string, name: string): Promi
   header.model ??= first.model
   header.cwd ??= first.cwd
   header.worktree ??= first.worktree
+  let binding = bindings.get(agentId)
+  if (!binding && Object.hasOwn(routes, type)) {
+    try {
+      binding = { model: routeModel(routes[type]), instructions: await readRole($, type), type }
+      bindings.set(agentId, binding)
+    } catch (error) { return `ext-agent: ${String(error)}` }
+  }
+  if (binding) header.model = binding.model
   const spec = await specOf($, header.model)
   if ('error' in spec) return `ext-agent: ${usage(spec.error)}`
   if (!header.body) return 'ext-agent: the prompt is empty.'
@@ -545,14 +591,15 @@ async function started($: EngineInterface, agentId: string, name: string): Promi
     if ('error' in made) return `ext-agent: worktree "${header.worktree}" failed: ${made.error}`
     cwd = made.path
   }
-  const key = `ext-${name.replace(/[^A-Za-z0-9_-]/g, '-')}`
+  const key = `ext-${(binding ? agentId : name).replace(/[^A-Za-z0-9_-]/g, '-')}`
+  const task = binding ? rolePrompt(binding.type, binding.instructions, header.body) : header.body
   let argv: string[]
   if (spec.cli === 'pi') {
-    argv = ['pi', '-p', '--mode', 'json', ...(spec.model ? ['--model', spec.model] : []), '--session-id', key, header.body]
+    argv = ['pi', '-p', '--mode', 'json', ...(spec.model ? ['--model', spec.model] : []), '--session-id', key, task]
   } else {
     const session = await opencodeSession($, cwd, key)
     argv = ['opencode', 'run', '--standalone', '--auto', '--format', 'json', ...(spec.model ? ['--model', spec.model] : []), '--title', key,
-      ...(session ? ['--session', session] : []), header.body]
+      ...(session ? ['--session', session] : []), task]
   }
   const run: Run = {
     spec, stream: $.process.spawn({ argv: supervised(cwd, argv, logOf(key)) }),
@@ -580,7 +627,7 @@ const workerStep: StreamHook<'turn.step'> = async function* ($, e, next) {
   if (e.agentId === undefined) return yield* next(e)
   const agentId = e.agentId
   const agent = (await $.agent.list()).find((a) => a.id === agentId)
-  if (agent === undefined || !isWorker(agent.type)) return yield* next(e)
+  if (agent === undefined || (!isWorker(agent.type) && !bindings.has(agent.id))) return yield* next(e)
 
   const finish = async function* (answer: string) {
     yield { kind: 'text', index: 1, text: answer } as TurnStepChunk
@@ -610,7 +657,8 @@ const workerStep: StreamHook<'turn.step'> = async function* ($, e, next) {
   let run = runs.get(agentId)
   if (e.index === 0 || run === undefined) {
     stop(agentId)
-    const made = await started($, agentId, agent.name ?? agent.id)
+    const made = await started($, agentId, agent.name ?? agent.id, agent.type)
+      .catch((error) => `ext-agent: external worker startup failed: ${String(error)}`)
     if (typeof made === 'string') return yield* report(made)
     run = made
   }
@@ -637,12 +685,16 @@ const workerStep: StreamHook<'turn.step'> = async function* ($, e, next) {
         toolUses: [{ name: ev.name, input: ev.input }], stopReason: 'tool_use' as const, usage: null,
       }
     }
+  } catch (error) {
+    stop(agentId)
+    return yield* report(`ext-agent: external worker failed: ${String(error)}`)
   } finally {
     next.signal.removeEventListener('abort', onAbort)
   }
 
   runs.delete(agentId)
   if (run.stalled) return yield* report(`ext-agent: stopped ${run.spec.cli} (${run.spec.model ?? 'default model'}): ${run.stalled}.${run.answer.trim() ? `\nLast text before it stalled:\n${run.answer.trim()}` : ''}`)
+  if (run.error || run.ended !== 'exit 0') return yield* report(failureOf(run))
   if (run.answer.trim()) return yield* report(`${run.answer.trim()}\n\n— answered by ${run.spec.cli}, ${run.answered}`)
   return yield* report(failureOf(run))
 }

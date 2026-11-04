@@ -1,6 +1,6 @@
 {
   "name": "ext-agent",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Run Claude Code subagents in pi or opencode instead of a Claude model. Adds the ext-agent:worker agent type; built-in subagents stay available unless you opt in to blocking them.",
   "author": {
     "name": "darkautism",
@@ -19,7 +19,7 @@
     "blockBuiltin": {
       "type": "boolean",
       "title": "Block built-in subagents",
-      "description": "Off (default): ext-agent:worker is added next to the built-in agent types. On: only ext-agent:worker can be dispatched; the built-in types are hidden and refused.",
+      "description": "Off (default): ext-agent:worker is added next to the built-in agent types. On: only ext-agent:worker and configured custom routes can be dispatched; other types are hidden and refused.",
       "default": false
     },
     "defaultModel": {
@@ -57,6 +57,12 @@
       "title": "Worktree seed command",
       "description": "A program and its arguments (split on spaces), run inside every worktree the plugin makes or reuses, for example one that clones a warm build cache into it. It must be safe to run again; its failure does not stop the worker. Empty (default): none.",
       "default": ""
+    },
+    "agentRoutes": {
+      "type": "string",
+      "title": "Custom agent routes (JSON)",
+      "description": "Exact subagent_type to {runtime, model (optional), instructionsFile}. Unlisted agents stay native. Role files are read before external execution. Example: {\"gsd-executor\":{\"runtime\":\"opencode\",\"model\":\"deepseek/deepseek-flash\",\"instructionsFile\":\"~/.claude/agents/gsd-executor.md\"}}",
+      "default": "{}"
     }
   },
   "icon": "./.claude-plugin/icon.png"
